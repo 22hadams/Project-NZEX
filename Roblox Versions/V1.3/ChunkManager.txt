@@ -1,0 +1,29 @@
+-- ChunkManager.lua
+
+local ChunkManager = {}
+ChunkManager.LoadedChunks = {}
+
+function ChunkManager:GetKey(cx, cz)
+	return tostring(cx) .. ":" .. tostring(cz)
+end
+
+function ChunkManager:IsChunkLoaded(cx, cz)
+	return self.LoadedChunks[self:GetKey(cx, cz)] ~= nil
+end
+
+function ChunkManager:MarkChunkLoaded(cx, cz, chunkParts)
+	self.LoadedChunks[self:GetKey(cx, cz)] = chunkParts
+end
+
+function ChunkManager:UnloadChunk(cx, cz)
+	local key = self:GetKey(cx, cz)
+	local parts = self.LoadedChunks[key]
+	if parts then
+		for _, part in ipairs(parts) do
+			part.Parent = nil -- Hide or recycle voxel
+		end
+		self.LoadedChunks[key] = nil
+	end
+end
+
+return ChunkManager

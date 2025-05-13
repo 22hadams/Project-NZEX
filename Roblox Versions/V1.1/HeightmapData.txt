@@ -1,0 +1,16 @@
+-- HeightmapData.lua
+
+local heightmap = {}
+
+for y = 1, 128 do
+	heightmap[y] = {}
+	for x = 1, 128 do
+		local dx = (x - 64) / 64
+		local dy = (y - 64) / 64
+		local distance = math.sqrt(dx*dx + dy*dy)
+		local height = math.max(0, 1 - distance) -- Smooth hill
+		heightmap[y][x] = height
+	end
+end
+
+return heightmap

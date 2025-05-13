@@ -1,0 +1,67 @@
+-- TerrainStreamer.lua
+-- Version 1.2 - Voxel Pooling
+
+print("✅ TerrainStreamer v1.2 Started!")
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Terrain = Workspace.Terrain
+
+-- Modules
+local Settings = require(ReplicatedStorage.Modules.SettingsModule)
+local Heightmap = require(ReplicatedStorage.Modules.HeightmapData)
+local VoxelPool = require(ReplicatedStorage.Modules.VoxelPool)
+
+-- World scaling
+local mapWidthPixels = #Heightmap[1]
+local MetersPerPixel = (Settings.WorldKilometers * 1000) / mapWidthPixels
+local OffsetX = (mapWidthPixels * MetersPerPixel) / 2
+local OffsetZ = (mapWidthPixels * MetersPerPixel) / 2
+
+-- Initialize Voxel Pool
+local voxelSize = Vector3.new(
+	MetersPerPixel * Settings.VoxelResolution,
+	MetersPerPixel * Settings.VoxelResolution,
+	MetersPerPixel * Settings.VoxelResolution
+)
+
+VoxelPool:Initialize(1000, voxelSize, Settings.DefaultMaterial, Settings.VoxelCastShadows)
+
+-- Smoothing
+local function smoothHeight(x, y)
+	local total = 0
+	local count = 0
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			if Heightmap[y + dy] and Heightmap[y + dy][x + dx] then
+				total += Heightmap[y + dy][x + dx]
+				count += 1
+			end
+		end
+	end
+	return total / math.max(count, 1)
+end
+
+-- Generate Terrain
+print("⛰️ Generating Terrain with Voxel Pool...")
+
+for y = 1, mapWidthPixels, Settings.VoxelResolution do
+	for x = 1, mapWidthPixels, Settings.VoxelResolution do
+		local heightValue = smoothHeight(x, y)
+		if heightValue > 0 then
+			local worldX = (x - 1) * MetersPerPixel - OffsetX
+			local worldZ = (y - 1) * MetersPerPixel - OffsetZ
+			local worldY = (heightValue * Settings.MaxHeightMeters) / 2
+
+			local voxel = VoxelPool:GetVoxel()
+			voxel.Size = voxelSize
+			voxel.Material = Settings.DefaultMaterial
+			voxel.CastShadow = Settings.VoxelCastShadows
+			voxel.CFrame = CFrame.new(worldX, worldY / 2, worldZ)
+			voxel.Parent = Workspace
+		end
+	end
+end
+
+print("✅ Voxel-Based Terrain Generation Complete!")

@@ -1,0 +1,22 @@
+-- MaterialManager.lua
+
+local MaterialManager = {}
+
+-- Define basic thresholds
+MaterialManager.SeaLevel = 0.1 -- 10% of max height
+MaterialManager.DirtLevel = 0.4 -- 40% of max height
+MaterialManager.RockLevel = 0.7 -- 70% of max height
+
+function MaterialManager:GetMaterial(normalizedHeight)
+	if normalizedHeight < self.SeaLevel then
+		return Enum.Material.Sand
+	elseif normalizedHeight < self.DirtLevel then
+		return Enum.Material.Grass
+	elseif normalizedHeight < self.RockLevel then
+		return Enum.Material.Ground
+	else
+		return Enum.Material.Rock
+	end
+end
+
+return MaterialManager

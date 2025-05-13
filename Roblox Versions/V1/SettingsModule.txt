@@ -1,0 +1,10 @@
+-- SettingsModule.lua
+
+local Settings = {}
+
+Settings.WorldKilometers = 10
+Settings.MaxHeightMeters = 500
+Settings.VoxelResolution = 2
+Settings.DefaultMaterial = Enum.Material.Grass
+
+return Settings

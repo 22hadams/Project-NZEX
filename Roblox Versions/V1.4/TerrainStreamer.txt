@@ -1,0 +1,128 @@
+-- TerrainStreamer.lua
+-- Version 1.4 - Level of Detail (LOD) System
+
+print("✅ TerrainStreamer v1.4 Started!")
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Settings = require(ReplicatedStorage.Modules.SettingsModule)
+local Heightmap = require(ReplicatedStorage.Modules.HeightmapData)
+local VoxelPool = require(ReplicatedStorage.Modules.VoxelPool)
+local ChunkManager = require(ReplicatedStorage.Modules.ChunkManager)
+local LODManager = require(ReplicatedStorage.Modules.LODManager)
+
+local Terrain = Workspace.Terrain
+
+-- World scaling
+local mapWidthPixels = #Heightmap[1]
+local MetersPerPixel = (Settings.WorldKilometers * 1000) / mapWidthPixels
+local OffsetX = (mapWidthPixels * MetersPerPixel) / 2
+local OffsetZ = (mapWidthPixels * MetersPerPixel) / 2
+local ChunkPixelSize = 32
+local ChunkWorldSize = ChunkPixelSize * MetersPerPixel
+
+-- Initialize Voxel Pool
+local voxelSizeBase = Vector3.new(
+	MetersPerPixel,
+	MetersPerPixel,
+	MetersPerPixel
+)
+
+VoxelPool:Initialize(3000, voxelSizeBase, Settings.DefaultMaterial, Settings.VoxelCastShadows)
+
+-- Helpers
+local function smoothHeight(x, y)
+	local total = 0
+	local count = 0
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			if Heightmap[y + dy] and Heightmap[y + dy][x + dx] then
+				total += Heightmap[y + dy][x + dx]
+				count += 1
+			end
+		end
+	end
+	return total / math.max(count, 1)
+end
+
+local function generateChunk(cx, cz, playerChunkX, playerChunkZ)
+	local chunkParts = {}
+
+	-- Calculate distance from player
+	local dx = cx - playerChunkX
+	local dz = cz - playerChunkZ
+	local distance = math.max(math.abs(dx), math.abs(dz))
+	local lodMultiplier = LODManager:GetLODForDistance(distance)
+
+	for y = cz * ChunkPixelSize + 1, (cz + 1) * ChunkPixelSize, Settings.VoxelResolution * lodMultiplier do
+		for x = cx * ChunkPixelSize + 1, (cx + 1) * ChunkPixelSize, Settings.VoxelResolution * lodMultiplier do
+			if Heightmap[y] and Heightmap[y][x] then
+				local heightValue = smoothHeight(x, y)
+				if heightValue > 0 then
+					local worldX = (x - 1) * MetersPerPixel - OffsetX
+					local worldZ = (y - 1) * MetersPerPixel - OffsetZ
+					local worldY = (heightValue * Settings.MaxHeightMeters) / 2
+
+					local voxel = VoxelPool:GetVoxel()
+					voxel.Size = voxelSizeBase * lodMultiplier
+					voxel.Material = Settings.DefaultMaterial
+					voxel.CastShadow = Settings.VoxelCastShadows
+					voxel.CFrame = CFrame.new(worldX, worldY / 2, worldZ)
+					voxel.Parent = Workspace
+
+					table.insert(chunkParts, voxel)
+				end
+			end
+		end
+	end
+
+	ChunkManager:MarkChunkLoaded(cx, cz, chunkParts)
+end
+
+local function getPlayerChunkPosition(position)
+	local chunkX = math.floor((position.X + OffsetX) / ChunkWorldSize)
+	local chunkZ = math.floor((position.Z + OffsetZ) / ChunkWorldSize)
+	return chunkX, chunkZ
+end
+
+-- Streaming loop
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function(character)
+		local hrp = character:WaitForChild("HumanoidRootPart")
+
+		RunService.Heartbeat:Connect(function()
+			local pos = hrp.Position
+			local cx, cz = getPlayerChunkPosition(pos)
+
+			local radius = 3
+			local neededChunks = {}
+
+			for dx = -radius, radius do
+				for dz = -radius, radius do
+					local ncx, ncz = cx + dx, cz + dz
+					table.insert(neededChunks, ChunkManager:GetKey(ncx, ncz))
+					if not ChunkManager:IsChunkLoaded(ncx, ncz) then
+						generateChunk(ncx, ncz, cx, cz)
+					end
+				end
+			end
+
+			-- Unload far chunks
+			for key, _ in pairs(ChunkManager.LoadedChunks) do
+				if not table.find(neededChunks, key) then
+					local parts = ChunkManager.LoadedChunks[key]
+					for _, voxel in ipairs(parts) do
+						VoxelPool:ReturnVoxel(voxel)
+					end
+					ChunkManager.LoadedChunks[key] = nil
+				end
+			end
+		end)
+	end)
+end)
+
+print("✅ LOD Terrain Streaming Ready!")

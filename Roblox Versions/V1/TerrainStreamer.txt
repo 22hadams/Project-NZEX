@@ -1,0 +1,60 @@
+-- TerrainStreamer.lua
+-- Version 1.1 - Modularized
+
+print("✅ TerrainStreamer v1.1 Started!")
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Terrain = Workspace.Terrain
+
+-- Modules
+local Settings = require(ReplicatedStorage.Modules.SettingsModule)
+local Heightmap = require(ReplicatedStorage.Modules.HeightmapData)
+
+-- World scaling
+local mapWidthPixels = #Heightmap[1]
+local MetersPerPixel = (Settings.WorldKilometers * 1000) / mapWidthPixels
+local OffsetX = (mapWidthPixels * MetersPerPixel) / 2
+local OffsetZ = (mapWidthPixels * MetersPerPixel) / 2
+
+-- Smoothing
+local function smoothHeight(x, y)
+	local total = 0
+	local count = 0
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			if Heightmap[y + dy] and Heightmap[y + dy][x + dx] then
+				total += Heightmap[y + dy][x + dx]
+				count += 1
+			end
+		end
+	end
+	return total / math.max(count, 1)
+end
+
+-- Generate Terrain
+print("⛰️ Generating Terrain...")
+
+for y = 1, mapWidthPixels, Settings.VoxelResolution do
+	for x = 1, mapWidthPixels, Settings.VoxelResolution do
+		local heightValue = smoothHeight(x, y)
+		if heightValue > 0 then
+			local worldX = (x - 1) * MetersPerPixel - OffsetX
+			local worldZ = (y - 1) * MetersPerPixel - OffsetZ
+			local worldY = (heightValue * Settings.MaxHeightMeters) / 2
+
+			Terrain:FillBlock(
+				CFrame.new(worldX, worldY / 2, worldZ),
+				Vector3.new(
+					MetersPerPixel * Settings.VoxelResolution,
+					math.max(worldY, 5),
+					MetersPerPixel * Settings.VoxelResolution
+				),
+				Settings.DefaultMaterial
+			)
+		end
+	end
+end
+
+print("✅ Terrain Generation Complete!")

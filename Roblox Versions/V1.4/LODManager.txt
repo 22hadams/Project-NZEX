@@ -1,0 +1,21 @@
+-- LODManager.lua
+
+local LODManager = {}
+
+-- Define LOD ranges (in chunks)
+LODManager.LODSettings = {
+	{ Radius = 1, VoxelMultiplier = 1 }, -- Closest chunks, full detail
+	{ Radius = 2, VoxelMultiplier = 2 }, -- Medium chunks, half detail
+	{ Radius = 3, VoxelMultiplier = 4 }, -- Far chunks, quarter detail
+}
+
+function LODManager:GetLODForDistance(distanceInChunks)
+	for _, setting in ipairs(self.LODSettings) do
+		if distanceInChunks <= setting.Radius then
+			return setting.VoxelMultiplier
+		end
+	end
+	return 8 -- Very far chunks = super low detail
+end
+
+return LODManager

@@ -1,0 +1,12 @@
+{
+    "name": "TrickleFeedModules",
+    "tree": {
+        "$className": "DataModel",
+        "ReplicatedStorage": {
+            "$className": "ReplicatedStorage",
+            "Modules": {
+                "$path": "src_staging"
+            }
+        }
+    }
+}

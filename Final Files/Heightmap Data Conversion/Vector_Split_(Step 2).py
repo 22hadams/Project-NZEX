@@ -3,7 +3,7 @@ import os
 # CONFIGURATION
 INPUT_FILE = "vector_table.lua"
 OUTPUT_DIR = "vector_table_chunks"
-CHUNKS = 10  # number of chunks to generate
+CHUNKS = 40  # number of chunks to generate
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)

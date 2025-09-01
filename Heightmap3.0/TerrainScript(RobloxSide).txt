@@ -1,0 +1,815 @@
+-- ChunkStreamServer_anchored_with_edge_blend.lua
+-- Place in ServerScriptService
+-- This handles chunk streaming with coordinate anchoring and edge blending
+-- TODO: might want to optimize the neighbor caching later
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Terrain = Workspace:WaitForChild("Terrain")
+
+-- ========== Configuration Settings ==========
+-- Scale factors for input coordinates
+local GLOBAL_CHUNK_SCALE = { x = 1.0, y = 1.0, z = 1.0 }
+local RES = 4  -- voxel resolution - Roblox requires this to be 4
+local PLACEMENT_MATERIAL = Enum.Material.Grass
+local GAP_FILL_RADIUS = 100    -- how far to search for nearest points
+local EDGE_FILL_RADIUS = 16    -- edge stitching radius
+local SMOOTH_RADIUS = 1        -- smoothing kernel size
+local SMOOTH_ITERS = 1         -- number of smoothing passes
+local PAUSE_BETWEEN_WRITES = 0.06  -- prevent lag spikes
+local SURFACE_ONLY = false     -- set to true for hollow terrain
+local DEBUG = false           -- enable debug prints
+local MAX_VOXEL_CELLS = 90 * 1000 * 1000  -- safety limit
+
+-- Chunk positioning (these need to be multiples of RES!)
+local CHUNK_SIZE_X = 488
+local CHUNK_SIZE_Z = 620
+local OFFSET_X = 0  -- world position offset for chunk 0
+local OFFSET_Z = 0
+
+-- Edge blending settings - helps remove ugly seams between chunks
+local EDGE_BLEND_ENABLED = false  -- turn this on if you want smoother chunk borders
+local EDGE_BLEND_FEATHER = 6      -- blend zone width in grid cells
+
+-- ==========================================
+
+-- Debug and utility functions
+local function dbg(message, ...)
+    if DEBUG then
+        print(("[%s] " .. message):format(os.date("%X"), ...))
+    end
+end
+
+local function warnf(message, ...)
+    warn(("[%s] " .. message):format(os.date("%X"), ...))
+end
+
+local function clamp(value, min_val, max_val)
+    if value < min_val then return min_val end
+    if value > max_val then return max_val end
+    return value
+end
+
+-- Validate configuration
+if (CHUNK_SIZE_X % RES) ~= 0 or (CHUNK_SIZE_Z % RES) ~= 0 then
+    warnf("Warning: CHUNK_SIZE_X/Z should be multiples of RES=%d. Current: X=%d, Z=%d", 
+          RES, CHUNK_SIZE_X, CHUNK_SIZE_Z)
+end
+
+-- Set up status tracking in ReplicatedStorage
+local statusFolder = ReplicatedStorage:FindFirstChild("ChunkStreamStatus")
+if not statusFolder then
+    statusFolder = Instance.new("Folder")
+    statusFolder.Name = "ChunkStreamStatus"
+    statusFolder.Parent = ReplicatedStorage
+end
+
+-- Helper to create or find status values
+local function createStatusValue(name, valueType, initialValue)
+    local existingValue = statusFolder:FindFirstChild(name)
+    if not existingValue then
+        existingValue = Instance.new(valueType)
+        existingValue.Name = name
+        existingValue.Parent = statusFolder
+    end
+    if initialValue ~= nil then
+        if valueType == "NumberValue" then
+            existingValue.Value = tonumber(initialValue)
+        elseif valueType == "IntValue" then
+            existingValue.Value = math.floor(initialValue)
+        else
+            existingValue.Value = tostring(initialValue)
+        end
+    end
+    return existingValue
+end
+
+local ProgressValue = createStatusValue("Progress", "NumberValue", 0)
+local ProcessedChunksVal = createStatusValue("ProcessedChunks", "IntValue", 0)
+local TotalChunksVal = createStatusValue("TotalChunks", "IntValue", 0)
+local StatusTextVal = createStatusValue("StatusText", "StringValue", "")
+
+-- Remote event for progress updates
+local progressRemote = ReplicatedStorage:FindFirstChild("ChunkStreamProgress")
+if not progressRemote then
+    progressRemote = Instance.new("RemoteEvent")
+    progressRemote.Name = "ChunkStreamProgress"
+    progressRemote.Parent = ReplicatedStorage
+end
+
+local chunksRoot = ReplicatedStorage:WaitForChild("Chunks")
+
+-- Extract coordinates from various point formats
+-- I've seen points come in as Vector3, tables with indices, or named fields
+local function extractPointCoordinates(point)
+    if typeof and typeof(point) == "Vector3" then
+        return point.X, point.Y, point.Z
+    elseif type(point) == "table" then
+        -- Try array-style access first
+        if tonumber(point[1]) and tonumber(point[2]) and tonumber(point[3]) then
+            return tonumber(point[1]), tonumber(point[2]), tonumber(point[3])
+        end
+        -- Try named field access
+        if tonumber(point.x) and tonumber(point.y) and tonumber(point.z) then
+            return tonumber(point.x), tonumber(point.y), tonumber(point.z)
+        end
+    end
+    return nil, nil, nil  -- couldn't parse
+end
+
+-- Create 3D grids for materials and occupancy
+local function createVoxelGrids(sizeX, sizeY, sizeZ, defaultMaterial)
+    local materialGrid = {}
+    local occupancyGrid = {}
+    
+    for x = 1, sizeX do
+        materialGrid[x] = {}
+        occupancyGrid[x] = {}
+        for y = 1, sizeY do
+            materialGrid[x][y] = {}
+            occupancyGrid[x][y] = {}
+            for z = 1, sizeZ do
+                materialGrid[x][y][z] = defaultMaterial
+                occupancyGrid[x][y][z] = 0
+            end
+        end
+    end
+    
+    return materialGrid, occupancyGrid
+end
+
+-- Fill gaps by finding nearest valid points within radius
+local function fillGapsWithNearestNeighbor(surfaceMap, gridX, gridZ, searchRadius)
+    local result = {}
+    for i = 1, gridX do
+        result[i] = {}
+    end
+    
+    for x = 1, gridX do
+        for z = 1, gridZ do
+            if surfaceMap and surfaceMap[x] and surfaceMap[x][z] then
+                -- Already has data
+                result[x][z] = surfaceMap[x][z]
+            else
+                -- Need to find nearest neighbor
+                local nearestValue = nil
+                for radius = 1, searchRadius do
+                    if nearestValue then break end
+                    
+                    -- Search in expanding square pattern
+                    for deltaX = -radius, radius do
+                        local remainingDist = radius - math.abs(deltaX)
+                        local deltaZOptions = {-remainingDist, remainingDist}
+                        
+                        for _, deltaZ in ipairs(deltaZOptions) do
+                            local neighborX = x + deltaX
+                            local neighborZ = z + deltaZ
+                            
+                            if neighborX >= 1 and neighborX <= gridX and 
+                               neighborZ >= 1 and neighborZ <= gridZ then
+                                local neighborValue = surfaceMap and surfaceMap[neighborX] and surfaceMap[neighborX][neighborZ]
+                                if neighborValue then
+                                    nearestValue = neighborValue
+                                    break
+                                end
+                            end
+                        end
+                        if nearestValue then break end
+                    end
+                end
+                result[x][z] = nearestValue
+            end
+        end
+    end
+    
+    return result
+end
+
+-- Fill edge gaps specifically - this helps with chunk boundaries
+local function fillEdgeGaps(sampledData, gridX, gridZ, fillRadius)
+    local stitchedData = {}
+    local fillCount = 0
+    
+    if type(sampledData) ~= "table" then
+        return sampledData, stitchedData, 0
+    end
+    
+    for x = 1, gridX do
+        stitchedData[x] = {}
+    end
+    
+    for x = 1, gridX do
+        for z = 1, gridZ do
+            local isEdgeCell = (x == 1 or x == gridX or z == 1 or z == gridZ)
+            
+            if isEdgeCell and not (sampledData[x] and sampledData[x][z]) then
+                local bestValue = nil
+                
+                for radius = 1, fillRadius do
+                    if bestValue then break end
+                    
+                    for deltaX = -radius, radius do
+                        local deltaZ = radius - math.abs(deltaX)
+                        for _, zSign in ipairs({-1, 1}) do
+                            local neighborX = x + deltaX
+                            local neighborZ = z + deltaZ * zSign
+                            
+                            if neighborX >= 1 and neighborX <= gridX and 
+                               neighborZ >= 1 and neighborZ <= gridZ then
+                                local value = sampledData[neighborX] and sampledData[neighborX][neighborZ]
+                                if value then
+                                    bestValue = value
+                                    break
+                                end
+                            end
+                        end
+                        if bestValue then break end
+                    end
+                end
+                
+                if bestValue then
+                    sampledData[x][z] = bestValue
+                    stitchedData[x][z] = true
+                    fillCount = fillCount + 1
+                end
+            end
+        end
+    end
+    
+    return sampledData, stitchedData, fillCount
+end
+
+-- Inverse Distance Weighting interpolation
+-- This smooths out the surface nicely
+local function applyIDWInterpolation(sampledData, gridX, gridZ, interpolationRadius)
+    local smoothedSurface = {}
+    local epsilon = 1e-6  -- prevent division by zero
+    
+    for x = 1, gridX do
+        smoothedSurface[x] = {}
+        for z = 1, gridZ do
+            local weightSum = 0
+            local weightedHeightSum = 0
+            
+            for deltaX = -interpolationRadius, interpolationRadius do
+                for deltaZ = -interpolationRadius, interpolationRadius do
+                    local neighborX = x + deltaX
+                    local neighborZ = z + deltaZ
+                    
+                    if neighborX >= 1 and neighborX <= gridX and 
+                       neighborZ >= 1 and neighborZ <= gridZ then
+                        local heightValue = sampledData[neighborX] and sampledData[neighborX][neighborZ]
+                        if heightValue then
+                            local distance = math.sqrt(deltaX * deltaX + deltaZ * deltaZ)
+                            local weight = 1 / math.max(distance, epsilon)
+                            weightSum = weightSum + weight
+                            weightedHeightSum = weightedHeightSum + weight * heightValue
+                        end
+                    end
+                end
+            end
+            
+            if weightSum == 0 then
+                smoothedSurface[x][z] = (sampledData[x] and sampledData[x][z]) or nil
+            else
+                smoothedSurface[x][z] = weightedHeightSum / weightSum
+            end
+        end
+    end
+    
+    return smoothedSurface
+end
+
+-- Smooth grid using average of neighbors - helps reduce jagged terrain
+local function smoothHeightGrid(heightGrid, gridX, gridZ, iterations)
+    if type(heightGrid) ~= "table" then
+        return heightGrid
+    end
+    
+    for iteration = 1, iterations do
+        local tempGrid = {}
+        for x = 1, gridX do
+            tempGrid[x] = {}
+        end
+        
+        for x = 1, gridX do
+            for z = 1, gridZ do
+                local sum = 0
+                local count = 0
+                
+                -- Check 3x3 neighborhood
+                for deltaX = -1, 1 do
+                    for deltaZ = -1, 1 do
+                        local neighborX = x + deltaX
+                        local neighborZ = z + deltaZ
+                        
+                        if neighborX >= 1 and neighborX <= gridX and 
+                           neighborZ >= 1 and neighborZ <= gridZ and 
+                           heightGrid[neighborX] and heightGrid[neighborX][neighborZ] ~= nil then
+                            sum = sum + heightGrid[neighborX][neighborZ]
+                            count = count + 1
+                        end
+                    end
+                end
+                
+                if count > 0 then
+                    tempGrid[x][z] = math.floor(sum / count + 0.5)  -- round to nearest integer
+                else
+                    tempGrid[x][z] = heightGrid[x] and heightGrid[x][z]
+                end
+            end
+        end
+        
+        heightGrid = tempGrid
+    end
+    
+    return heightGrid
+end
+
+-- Calculate region boundaries based on chunk coordinates
+local function calculateChunkRegion(chunkX, chunkZ, minHeight, maxHeight)
+    local worldMinX = chunkX * CHUNK_SIZE_X + OFFSET_X
+    local worldMinZ = chunkZ * CHUNK_SIZE_Z + OFFSET_Z
+    
+    -- Align to RES grid
+    local alignedMinY = math.floor(minHeight / RES) * RES
+    local heightSpan = math.max(RES, math.ceil((maxHeight - alignedMinY) / RES) * RES)
+    
+    local regionMin = Vector3.new(worldMinX, alignedMinY, worldMinZ)
+    local regionMax = Vector3.new(worldMinX + CHUNK_SIZE_X, alignedMinY + heightSpan, worldMinZ + CHUNK_SIZE_Z)
+    
+    local region = Region3.new(regionMin, regionMax):ExpandToGrid(RES)
+    local regionSize = region.Size
+    local regionCenter = region.CFrame.Position
+    local actualMin = regionCenter - regionSize * 0.5
+    
+    local gridSizeX = math.floor(regionSize.X / RES + 0.5)
+    local gridSizeY = math.floor(regionSize.Y / RES + 0.5)
+    local gridSizeZ = math.floor(regionSize.Z / RES + 0.5)
+    
+    return region, actualMin, regionSize, gridSizeX, gridSizeY, gridSizeZ
+end
+
+-- Compute height grid for a chunk without writing to terrain
+-- This is useful for neighbor blending calculations
+local function computeChunkHeightGrid(chunkX, chunkZ, pointData)
+    if type(pointData) ~= "table" or #pointData == 0 then
+        return nil, "no valid point data"
+    end
+    
+    -- Find Y bounds first
+    local minY = math.huge
+    local maxY = -math.huge
+    
+    for _, point in ipairs(pointData) do
+        local _, y, _ = extractPointCoordinates(point)
+        if y then
+            local scaledY = y * (GLOBAL_CHUNK_SCALE.y or 1)
+            minY = math.min(minY, scaledY)
+            maxY = math.max(maxY, scaledY)
+        end
+    end
+    
+    if minY == math.huge then
+        return nil, "no valid Y coordinates found"
+    end
+    
+    -- Calculate region
+    local success, region, regionMin, regionSize, gx, gy, gz = pcall(function()
+        return calculateChunkRegion(chunkX, chunkZ, minY, maxY)
+    end)
+    
+    if not success then
+        return nil, "region calculation failed"
+    end
+    
+    region, regionMin, regionSize, gx, gy, gz = region, regionMin, regionSize, gx, gy, gz
+    
+    if gx <= 0 or gy <= 0 or gz <= 0 then
+        return nil, "invalid grid dimensions"
+    end
+    
+    if gx * gy * gz > MAX_VOXEL_CELLS then
+        return nil, "grid too large for memory limits"
+    end
+    
+    -- Helper functions to convert world coordinates to grid indices
+    local function worldXToGridIndex(worldX)
+        return clamp(math.floor((worldX - regionMin.X) / RES + 0.000001) + 1, 1, gx)
+    end
+    
+    local function worldZToGridIndex(worldZ)
+        return clamp(math.floor((worldZ - regionMin.Z) / RES + 0.000001) + 1, 1, gz)
+    end
+    
+    -- Sample highest Y value per grid cell
+    local sampledHeights = {}
+    for x = 1, gx do
+        sampledHeights[x] = {}
+    end
+    
+    for _, point in ipairs(pointData) do
+        local worldX, worldY, worldZ = extractPointCoordinates(point)
+        if worldX and worldY and worldZ then
+            -- Apply scaling
+            worldX = worldX * (GLOBAL_CHUNK_SCALE.x or 1)
+            worldY = worldY * (GLOBAL_CHUNK_SCALE.y or 1)
+            worldZ = worldZ * (GLOBAL_CHUNK_SCALE.z or 1)
+            
+            local gridX = worldXToGridIndex(worldX)
+            local gridZ = worldZToGridIndex(worldZ)
+            
+            if gridX and gridZ then
+                if not sampledHeights[gridX][gridZ] or worldY > sampledHeights[gridX][gridZ] then
+                    sampledHeights[gridX][gridZ] = worldY
+                end
+            end
+        end
+    end
+    
+    -- Apply processing pipeline: gap fill -> edge fill -> IDW -> smooth
+    local filledHeights = fillGapsWithNearestNeighbor(sampledHeights, gx, gz, GAP_FILL_RADIUS)
+    local edgeFilledHeights, stitchedAreas, edgeCount = fillEdgeGaps(filledHeights, gx, gz, EDGE_FILL_RADIUS)
+    local interpolatedSurface = applyIDWInterpolation(edgeFilledHeights, gx, gz, SMOOTH_RADIUS)
+    
+    -- Convert to integer height indices
+    local heightGrid = {}
+    for x = 1, gx do
+        heightGrid[x] = {}
+        for z = 1, gz do
+            local worldHeight = (interpolatedSurface[x] and interpolatedSurface[x][z]) or 
+                               (edgeFilledHeights[x] and edgeFilledHeights[x][z]) or 
+                               (filledHeights[x] and filledHeights[x][z]) or 
+                               regionMin.Y
+            
+            local heightIndex = math.floor((worldHeight - regionMin.Y) / RES + 0.5)
+            heightGrid[x][z] = clamp(heightIndex, 0, gy - 1)
+        end
+    end
+    
+    if SMOOTH_ITERS > 0 then
+        heightGrid = smoothHeightGrid(heightGrid, gx, gz, SMOOTH_ITERS)
+    end
+    
+    return {
+        gridH = heightGrid,
+        gx = gx, gy = gy, gz = gz,
+        region = region, rMin = regionMin, rSize = regionSize,
+        stitch = stitchedAreas
+    }
+end
+
+-- Cache for neighbor chunk grids - avoids recomputing the same chunks
+local neighborCache = {}
+
+-- Get or compute a neighbor chunk's grid data
+local function getNeighborChunkGrid(neighborX, neighborZ, chunkModuleMap)
+    local cacheKey = neighborX .. ":" .. neighborZ
+    
+    if neighborCache[cacheKey] then
+        return neighborCache[cacheKey]
+    end
+    
+    local moduleEntry = chunkModuleMap and chunkModuleMap[cacheKey]
+    if not moduleEntry then
+        return nil
+    end
+    
+    local success, chunkData = pcall(function()
+        return require(moduleEntry.module)
+    end)
+    
+    if not success or type(chunkData) ~= "table" then
+        return nil
+    end
+    
+    local success2, result = pcall(function()
+        return computeChunkHeightGrid(neighborX, neighborZ, chunkData)
+    end)
+    
+    if not success2 or not result then
+        return nil
+    end
+    
+    neighborCache[cacheKey] = result
+    return result
+end
+
+-- Blend chunk edges with neighbors to remove seams
+-- This is where the magic happens for smooth chunk transitions
+local function blendChunkEdges(heightGrid, gridX, gridZ, chunkModuleMap, currentChunkX, currentChunkZ)
+    if not EDGE_BLEND_ENABLED or EDGE_BLEND_FEATHER <= 0 then
+        return heightGrid
+    end
+    
+    local featherWidth = math.min(EDGE_BLEND_FEATHER, math.floor(gridX/2), math.floor(gridZ/2))
+    if featherWidth <= 0 then
+        return heightGrid
+    end
+    
+    -- Blend function: linear interpolation based on distance from edge
+    local function blendHeights(neighborHeight, currentHeight, blendIndex)
+        local alpha = blendIndex / (featherWidth + 1)
+        return math.floor((1 - alpha) * (neighborHeight or currentHeight) + alpha * (currentHeight or neighborHeight) + 0.5)
+    end
+    
+    -- Left neighbor blending (chunk X-1)
+    do
+        local leftNeighbor = getNeighborChunkGrid(currentChunkX - 1, currentChunkZ, chunkModuleMap)
+        if leftNeighbor and leftNeighbor.gridH and leftNeighbor.gx == gridX and leftNeighbor.gz == gridZ then
+            for z = 1, gridZ do
+                for i = 1, featherWidth do
+                    local ourColumn = i
+                    local neighborColumn = leftNeighbor.gx - featherWidth + i
+                    neighborColumn = clamp(neighborColumn, 1, leftNeighbor.gx)
+                    
+                    local neighborHeight = leftNeighbor.gridH[neighborColumn] and leftNeighbor.gridH[neighborColumn][z]
+                    local ourHeight = heightGrid[ourColumn] and heightGrid[ourColumn][z]
+                    
+                    if neighborHeight and ourHeight and neighborHeight ~= ourHeight then
+                        heightGrid[ourColumn][z] = blendHeights(neighborHeight, ourHeight, i)
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Right neighbor blending (chunk X+1)
+    do
+        local rightNeighbor = getNeighborChunkGrid(currentChunkX + 1, currentChunkZ, chunkModuleMap)
+        if rightNeighbor and rightNeighbor.gridH and rightNeighbor.gx == gridX and rightNeighbor.gz == gridZ then
+            for z = 1, gridZ do
+                for i = 1, featherWidth do
+                    local ourColumn = gridX - featherWidth + i
+                    local neighborColumn = i
+                    ourColumn = clamp(ourColumn, 1, gridX)
+                    
+                    local neighborHeight = rightNeighbor.gridH[neighborColumn] and rightNeighbor.gridH[neighborColumn][z]
+                    local ourHeight = heightGrid[ourColumn] and heightGrid[ourColumn][z]
+                    
+                    if neighborHeight and ourHeight and neighborHeight ~= ourHeight then
+                        heightGrid[ourColumn][z] = blendHeights(neighborHeight, ourHeight, featherWidth - i + 1)
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Top neighbor blending (chunk Z-1)
+    do
+        local topNeighbor = getNeighborChunkGrid(currentChunkX, currentChunkZ - 1, chunkModuleMap)
+        if topNeighbor and topNeighbor.gridH and topNeighbor.gx == gridX and topNeighbor.gz == gridZ then
+            for x = 1, gridX do
+                for i = 1, featherWidth do
+                    local ourRow = i
+                    local neighborRow = topNeighbor.gz - featherWidth + i
+                    neighborRow = clamp(neighborRow, 1, topNeighbor.gz)
+                    
+                    local neighborHeight = topNeighbor.gridH[x] and topNeighbor.gridH[x][neighborRow]
+                    local ourHeight = heightGrid[x] and heightGrid[x][ourRow]
+                    
+                    if neighborHeight and ourHeight and neighborHeight ~= ourHeight then
+                        heightGrid[x][ourRow] = blendHeights(neighborHeight, ourHeight, i)
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Bottom neighbor blending (chunk Z+1)
+    do
+        local bottomNeighbor = getNeighborChunkGrid(currentChunkX, currentChunkZ + 1, chunkModuleMap)
+        if bottomNeighbor and bottomNeighbor.gridH and bottomNeighbor.gx == gridX and bottomNeighbor.gz == gridZ then
+            for x = 1, gridX do
+                for i = 1, featherWidth do
+                    local ourRow = gridZ - featherWidth + i
+                    local neighborRow = i
+                    ourRow = clamp(ourRow, 1, gridZ)
+                    
+                    local neighborHeight = bottomNeighbor.gridH[x] and bottomNeighbor.gridH[x][neighborRow]
+                    local ourHeight = heightGrid[x] and heightGrid[x][ourRow]
+                    
+                    if neighborHeight and ourHeight and neighborHeight ~= ourHeight then
+                        heightGrid[x][ourRow] = blendHeights(neighborHeight, ourHeight, featherWidth - i + 1)
+                    end
+                end
+            end
+        end
+    end
+    
+    return heightGrid
+end
+
+-- Main function: process chunk data and write to terrain
+local function processAndWriteChunk(chunkX, chunkZ, pointData, chunkModuleMap)
+    if type(pointData) ~= "table" or #pointData == 0 then
+        return false, "no valid chunk data provided"
+    end
+    
+    dbg("==== Processing chunk %d_%d with %d points ====", chunkX, chunkZ, #pointData)
+    
+    -- Compute height grid
+    local success, gridResult = pcall(function()
+        return computeChunkHeightGrid(chunkX, chunkZ, pointData)
+    end)
+    
+    if not success or not gridResult then
+        return false, ("Grid computation failed: %s"):format(tostring(gridResult))
+    end
+    
+    local heightGrid = gridResult.gridH
+    local gx, gy, gz = gridResult.gx, gridResult.gy, gridResult.gz
+    local regionMin = gridResult.rMin
+    local regionSize = gridResult.rSize
+    
+    dbg("Grid computed: min=(%.3f,%.3f,%.3f) size=(%.3f,%.3f,%.3f) dims=%dx%dx%d",
+        regionMin.X, regionMin.Y, regionMin.Z, regionSize.X, regionSize.Y, regionSize.Z, gx, gy, gz)
+    
+    -- Apply edge blending if enabled
+    if EDGE_BLEND_ENABLED then
+        neighborCache = neighborCache or {}  -- ensure cache exists
+        heightGrid = blendChunkEdges(heightGrid, gx, gz, chunkModuleMap, chunkX, chunkZ)
+        dbg("Edge blending completed for chunk %d_%d (feather=%d)", chunkX, chunkZ, EDGE_BLEND_FEATHER)
+    end
+    
+    -- Generate material and occupancy grids
+    local materialGrid, occupancyGrid = createVoxelGrids(gx, gy, gz, PLACEMENT_MATERIAL)
+    local totalVoxelsFilled = 0
+    
+    for x = 1, gx do
+        for z = 1, gz do
+            local surfaceIndex = clamp((heightGrid[x] and heightGrid[x][z] or 0) + 1, 1, gy)
+            
+            if SURFACE_ONLY then
+                -- Only fill the top surface
+                occupancyGrid[x][surfaceIndex][z] = 1
+                materialGrid[x][surfaceIndex][z] = PLACEMENT_MATERIAL
+                totalVoxelsFilled = totalVoxelsFilled + 1
+            else
+                -- Fill from bottom up to surface
+                for y = 1, surfaceIndex do
+                    occupancyGrid[x][y][z] = 1
+                    materialGrid[x][y][z] = PLACEMENT_MATERIAL
+                    totalVoxelsFilled = totalVoxelsFilled + 1
+                end
+            end
+        end
+    end
+    
+    dbg("Voxels filled: %d out of %d total", totalVoxelsFilled, gx * gy * gz)
+    
+    -- Write to Roblox terrain
+    dbg("Writing terrain for chunk %d_%d, region size=(%.2f,%.2f,%.2f), RES=%d", 
+        chunkX, chunkZ, regionSize.X, regionSize.Y, regionSize.Z, RES)
+    
+    local writeSuccess, writeError = pcall(function()
+        Terrain:WriteVoxels(gridResult.region, RES, materialGrid, occupancyGrid)
+    end)
+    
+    if writeSuccess then
+        dbg("Successfully wrote terrain for chunk %d_%d", chunkX, chunkZ)
+        return true
+    else
+        warnf("Terrain write failed for chunk %d_%d: %s", chunkX, chunkZ, tostring(writeError))
+        return false, tostring(writeError)
+    end
+end
+
+-- Scan ReplicatedStorage for all chunk modules
+local function findAllChunkModules()
+    local chunkList = {}
+    local chunkMap = {}
+    
+    for _, rowFolder in ipairs(chunksRoot:GetChildren()) do
+        if rowFolder:IsA("Folder") and tostring(rowFolder.Name):match("^Y_") then
+            for _, chunkFolder in ipairs(rowFolder:GetChildren()) do
+                if chunkFolder:IsA("Folder") then
+                    local chunkModule = chunkFolder:FindFirstChild(chunkFolder.Name)
+                    if chunkModule and chunkModule:IsA("ModuleScript") then
+                        local chunkName = chunkFolder.Name
+                        local cx, cz = chunkName:match("^Chunk([%-]?%d+)_([%-]?%d+)$")
+                        
+                        if cx and cz then
+                            cx = tonumber(cx)
+                            cz = tonumber(cz)
+                            
+                            local chunkEntry = {
+                                cx = cx, cz = cz,
+                                module = chunkModule,
+                                path = rowFolder.Name .. "/" .. chunkFolder.Name
+                            }
+                            
+                            table.insert(chunkList, chunkEntry)
+                            chunkMap[cx .. ":" .. cz] = chunkEntry
+                        else
+                            dbg("Skipping chunk with unexpected name format: %s", chunkFolder.Name)
+                        end
+                    else
+                        dbg("No module found in chunk folder: %s/%s", rowFolder.Name, chunkFolder.Name)
+                    end
+                end
+            end
+        end
+    end
+    
+    return chunkList, chunkMap
+end
+
+-- Main loader function - processes all chunks sequentially
+local function loadAndProcessAllChunks()
+    neighborCache = {}  -- clear cache at start
+    
+    local allChunks, moduleMap = findAllChunkModules()
+    dbg("Discovered %d chunk modules in ReplicatedStorage.Chunks", #allChunks)
+    
+    if #allChunks == 0 then
+        dbg("No chunks found to process")
+        return
+    end
+    
+    -- Initialize progress tracking
+    TotalChunksVal.Value = #allChunks
+    ProcessedChunksVal.Value = 0
+    ProgressValue.Value = 0
+    StatusTextVal.Value = ("Found %d chunks, starting processing..."):format(#allChunks)
+    
+    local successfulChunks = 0
+    
+    for index, chunkEntry in ipairs(allChunks) do
+        dbg("=== Processing chunk %d/%d: %s (Chunk%d_%d) ===", 
+            index, #allChunks, chunkEntry.path, chunkEntry.cx, chunkEntry.cz)
+        
+        local requireSuccess, chunkDataOrError = pcall(function()
+            return require(chunkEntry.module)
+        end)
+        
+        if not requireSuccess then
+            warnf("Failed to require module %s: %s", chunkEntry.path, tostring(chunkDataOrError))
+        else
+            if type(chunkDataOrError) ~= "table" then
+                warnf("Module %s returned %s instead of table, skipping", chunkEntry.path, type(chunkDataOrError))
+            else
+                local processSuccess, processResult = pcall(function()
+                    return processAndWriteChunk(chunkEntry.cx, chunkEntry.cz, chunkDataOrError, moduleMap)
+                end)
+                
+                if not processSuccess then
+                    warnf("Processing crashed for chunk %d_%d: %s", chunkEntry.cx, chunkEntry.cz, tostring(processResult))
+                else
+                    if processResult == true then
+                        successfulChunks = successfulChunks + 1
+                        ProcessedChunksVal.Value = successfulChunks
+                        
+                        local progressPercent = math.floor((successfulChunks / #allChunks) * 100 + 0.5)
+                        ProgressValue.Value = progressPercent
+                        StatusTextVal.Value = ("Processed %d / %d (%d%%) - last: %s")
+                            :format(successfulChunks, #allChunks, progressPercent, chunkEntry.path)
+                        
+                        -- Send progress update to clients
+                        pcall(function()
+                            progressRemote:FireAllClients({
+                                progress = ProgressValue.Value,
+                                processed = ProcessedChunksVal.Value,
+                                total = TotalChunksVal.Value,
+                                last = { x = chunkEntry.cx, z = chunkEntry.cz, path = chunkEntry.path },
+                            })
+                        end)
+                    else
+                        warnf("Processing failed for chunk %d_%d: %s", chunkEntry.cx, chunkEntry.cz, tostring(processResult))
+                    end
+                end
+            end
+        end
+        
+        -- Small pause to prevent lag
+        local pauseStart = tick()
+        while tick() - pauseStart < PAUSE_BETWEEN_WRITES do
+            RunService.Heartbeat:Wait()
+        end
+    end
+    
+    dbg("Chunk loading complete! Successfully processed %d out of %d chunks", successfulChunks, #allChunks)
+    StatusTextVal.Value = ("Complete! Processed %d chunks"):format(successfulChunks)
+    ProgressValue.Value = 100
+    
+    -- Final progress update
+    pcall(function()
+        progressRemote:FireAllClients({
+            progress = 100,
+            processed = successfulChunks,
+            total = #allChunks,
+            last = nil
+        })
+    end)
+end
+
+-- Start the loading process
+spawn(function()
+    dbg("[ChunkStreamServer] Starting chunk loading process...")
+    local success, error = pcall(loadAndProcessAllChunks)
+    if not success then
+        warnf("Chunk loading process failed: %s", tostring(error))
+    end
+    dbg("[ChunkStreamServer] Chunk loading process finished")
+end)
